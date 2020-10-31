@@ -19,6 +19,9 @@
 #include "ZE07CO.h"
 // T6615-CO2
 #include "T6615.h"
+// DS18B20
+#include <OneWire.h>
+#include <DallasTemperature.h>
 // WiFi secrets
 #include "secrets.h"
 // Sercom defs
@@ -29,11 +32,12 @@
 #define DEBUG
 #include "util.h"
 
-// Reading peridiocity in (ms)
-#define BME_680_PERIOD 5000 // every 5 seconds
-#define HPMA115S0_PERIOD 5*60000 // every 5*60 seconds
-#define ZE07_PERIOD 5*60000 // every 5*60 seconds
-#define T6615_PERIOD 5*60000 // every 5*60 seconds
+// Reading periodicity in (ms)
+#define BME_680_PERIOD 5000         // every 5 seconds
+#define HPMA115S0_PERIOD 5*60000    // every 5*60 seconds
+#define ZE07_PERIOD 5*60000         // every 5*60 seconds
+#define T6615_PERIOD 5*60000        // every 5*60 seconds
+#define DS18B20_PERIOD 5000         // every 5 seconds
 #define STATE_SAVE_PERIOD	UINT32_C(360 * 60 * 1000) // 360 minutes - 4 times a day
 
 /* Declared Functions */
@@ -41,9 +45,9 @@ void printWifiStatus();
 void onMqttMessage(int messageSize);
 void errLeds(void);
 void checkIaqSensorStatus(void);
-void checkIaqSensorStatus(MqttClient mqtt);
 void loadState(void);
 void updateState(void);
+void heartBeat(void);
 
 // Instantiate the extra Serial classes
 Uart Serial2(&sercom3, PIN_SERIAL2_RX, PIN_SERIAL2_TX, PAD_SERIAL2_RX, PAD_SERIAL2_TX);
@@ -71,9 +75,21 @@ T6615 t6615(&Serial3);
 uint16_t co2_ppm = 0, t6615Status;
 uint32_t _t6615_period = 20000;
 
+// DS18B20
+OneWire  ds(7);                     // on pin 7 (a 4.7K resistor is necessary)
+DallasTemperature ds18b20(&ds);     //
+float tempC;
+uint32_t _ds18b20_period = 1000;
+enum ds18b20state {
+    ds18b20_askTemperature = 0, 
+    ds18b20_readTemperature 
+}; 
+uint8_t _ds18b20_status = ds18b20_askTemperature;
+
 // General Use Variables
-unsigned long bmeLastReading = 0, hpmaLastReading = 0, ze07LastReading = 0, t6615LastReading = 0;
-uint8_t retrys = 0;
+unsigned long bmeLastReading = 0, hpmaLastReading = 0, ze07LastReading = 0, \
+              t6615LastReading = 0, ds18b20LastReading = 0, lastHeartBeat = 0;
+uint8_t retries = 0;
 char ssid[] = SECRET_SSID;        // your network SSID (name)
 char pass[] = SECRET_PASS;    // your network password (use for WPA, or use as key for WEP)
 
@@ -101,7 +117,8 @@ const char * outTopic[] =  { "MKR1000/HPMA115S0/PM2.5",
                              "MKR1000/ZE07/CO",
                              "MKR1000/T6615/CO2",
                              "MKR1000/BME680/rawTemp",
-                             "MKR1000/BME680/rawHumi"
+                             "MKR1000/BME680/rawHumi",
+                             "MKR1000/DS18B20/rawTemp"
                            };
 String payload          = "";
 
@@ -139,14 +156,14 @@ void setup() {
     // start the WiFi OTA library with internal (flash) based storage
     WiFiOTA.begin("Arduino", "jf123", InternalStorage);
 
-    // You can provide a unique client ID, if not set the library uses Arduin-millis()
+    // You can provide a unique client ID, if not set the library uses Arduino-millis()
     // Each client must have a unique client ID
     mqttClient.setId("MKR1000");
 
     // You can provide a username and password for authentication
     // mqttClient.setUsernamePassword("username", "password");
 
-    // set a will message, used by the broker when the connection dies unexpectantly
+    // set a will message, used by the broker when the connection dies unexpectedly
     // you must know the size of the message before hand, and it must be set before connecting
     String willPayload = "disconnected!";
     bool willRetain = true;
@@ -224,6 +241,10 @@ void setup() {
     //// start warmup
     t6615.start_warmup();
 
+    /// DS18B20
+    /// init sensor
+    ds18b20.begin();
+
     // On success hold the led on
     digitalWrite(LED_BUILTIN,HIGH);
 }
@@ -243,6 +264,8 @@ void loop() {
         _printf((char*)"Re-connected!\r\n");
         // re-configure OTA again
         WiFiOTA.begin("Arduino", "jf123", InternalStorage);
+        // Re-enable the led state
+        digitalWrite(LED_BUILTIN,HIGH);
     }
 
     // check for WiFi OTA updates
@@ -252,15 +275,20 @@ void loop() {
     if(!mqttClient.connected()){
         _printf((char*)"Disconnected from Broker!\r\n");
         _printf((char*)"Unsubscribing from topic %s retval %d \r\n",inTopic,mqttClient.unsubscribe(inTopic));
-        while (!mqttClient.connect(broker, port)) {
+        while (!mqttClient.connect(broker, port) && (WiFi.status() == WL_CONNECTED)) {
             _printf((char*)"MQTT connection failed! Error code = %d \r\n",mqttClient.connectError());
             for(int i = 0; i < 25; i++) errLeds(); // wait 5 seconds and try again
         }
-        _printf((char*)"Subscribing again to topic %s retval %d \r\n",inTopic,mqttClient.subscribe(inTopic, subscribeQos));
+        // on success subscribe to inTopic
+        if(mqttClient.connected()){
+            _printf((char*)"Subscribing again to topic %s retval %d \r\n",inTopic,mqttClient.subscribe(inTopic, subscribeQos));
+            // Re-enable the led state
+            digitalWrite(LED_BUILTIN,HIGH);
+        }
     }
 
     // call poll() regularly to allow the library to receive MQTT messages and
-    // send MQTT keep alives which avoids being disconnected by the broker
+    // send MQTT keep alive which avoids being disconnected by the broker
     mqttClient.poll();
 
     if((millis() - bmeLastReading) > BME_680_PERIOD){
@@ -324,7 +352,6 @@ void loop() {
 
             updateState();
 
-            checkIaqSensorStatus(mqttClient);
             /*
             _printf((char*)"IAQ Accuracy %u \r\n",iaqSensor.iaqAccuracy);
             _printf((char*)"Breath Voc Accuracy %u \r\n",iaqSensor.breathVocAccuracy);
@@ -336,12 +363,12 @@ void loop() {
         }
     }
 
-    if((millis()-ze07LastReading) > ZE07_PERIOD){
+    if((millis() - ze07LastReading) > ZE07_PERIOD){
         ze07LastReading = millis();
 
         // read ze07
-        retrys = 5;
-        do{ co_ppm = ze07.read(); } while(((retrys--) > 0) && ((co_ppm < 0) || (co_ppm > 500)));
+        retries = 5;
+        do{ co_ppm = ze07.read(); } while(((retries--) > 0) && ((co_ppm < 0) || (co_ppm > 500)));
         
         payload = myFTOA(co_ppm,3,10);
         mqttClient.beginMessage(outTopic[9], payload.length(), retained, qos, dup);
@@ -349,7 +376,7 @@ void loop() {
         mqttClient.endMessage();
     }
 
-    if((millis()-t6615LastReading) > _t6615_period){
+    if((millis() - t6615LastReading) > _t6615_period){
         t6615LastReading = millis();
         t6615Status = t6615.get_status();
         if(t6615Status != T6615_TIMEOUT){
@@ -363,8 +390,8 @@ void loop() {
             else if(t6615Status == T6615_OK){
                 _t6615_period = T6615_PERIOD-20000; // go back ten seconds before period time to warmup
                 // read the sensor
-                retrys = 5;
-                do{ co2_ppm = t6615.read_co2();} while(((retrys--) > 0) && (co2_ppm == T6615_TIMEOUT));
+                retries = 5;
+                do{ co2_ppm = t6615.read_co2();} while(((retries--) > 0) && (co2_ppm == T6615_TIMEOUT));
                 // go to idle mode
                 t6615.idle_on();
                 // send via MQTT
@@ -416,8 +443,33 @@ void loop() {
                 mqttClient.endMessage();
             }
        
-            hpma115S0.StopParticleMeasurement(); // stop particle measurment
+            hpma115S0.StopParticleMeasurement(); // stop particle measurement
         }
+    }
+    
+    if((millis() - ds18b20LastReading) > _ds18b20_period){
+        ds18b20LastReading = millis(); // restart timer
+        if(_ds18b20_status == ds18b20_askTemperature){
+            _ds18b20_period = 100;                      // return again in 100 ms 
+            _ds18b20_status = ds18b20_readTemperature;  // update the new state
+            ds18b20.requestTemperatures();
+        }else{
+            _ds18b20_period = DS18B20_PERIOD-100;       // return in period minus 100 ms 
+            _ds18b20_status = ds18b20_askTemperature;   // update the new state
+            tempC = ds18b20.getTempCByIndex(0);         // read temperature
+            
+            // Send
+            payload = myFTOA(tempC,3,10);
+            mqttClient.beginMessage(outTopic[13], payload.length(), retained, qos, dup);
+            mqttClient.print(payload);
+            mqttClient.endMessage();
+        }
+
+    }
+
+    if((millis()-lastHeartBeat) > 1000){
+        lastHeartBeat = millis();
+        heartBeat();
     }
     
 }
@@ -508,32 +560,6 @@ void checkIaqSensorStatus(void){
     }
 }
 
-void checkIaqSensorStatus(MqttClient mqtt){
-    String payload = "";
-    
-    if (iaqSensor.status != BSEC_OK) {
-        if (iaqSensor.status < BSEC_OK) {
-            payload = "BSEC error code : " + String(iaqSensor.status);
-        } else {
-            payload = "BSEC warning code :" + String(iaqSensor.status);
-        }
-        mqtt.beginMessage("MKR1000/BME680/Status", payload.length(), retained, qos, dup);
-        mqtt.print(payload);
-        mqtt.endMessage();
-    }
-
-    if (iaqSensor.bme680Status != BME680_OK) {
-        if (iaqSensor.bme680Status < BME680_OK) {
-            payload = "BSEC error code : " + String(iaqSensor.bme680Status);
-        } else {
-            payload = "BSEC warning code :" + String(iaqSensor.bme680Status);
-        }
-        mqtt.beginMessage("MKR1000/BME680/Status", payload.length(), retained, qos, dup);
-        mqtt.print(payload);
-        mqtt.endMessage();
-    }
-}
-
 void errLeds(void){
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
@@ -604,4 +630,13 @@ void updateState(void){
     EEPROM.write(0, BSEC_MAX_STATE_BLOB_SIZE);
     EEPROM.commit();
   }
+}
+
+void heartBeat(void){
+    payload = "timestamp: " + String(millis()) + " bme: " + String(bmeLastReading)
+        + " ze07: " + String(ze07LastReading) + " t6615: " + String(t6615LastReading) 
+        + " hpma: " + String(hpmaLastReading);
+    mqttClient.beginMessage("MKR1000/HeartBeat", payload.length(), retained, qos, dup);
+    mqttClient.print(payload);
+    mqttClient.endMessage();
 }

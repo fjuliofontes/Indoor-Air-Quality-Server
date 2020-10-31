@@ -123,7 +123,7 @@ uint16_t HPMA115S0::ReadCmdResp(uint8_t * dataBuf, uint16_t dataBufSize, uint16_
  */
 boolean HPMA115S0::ReadParticleMeasurement(uint16_t * pm2_5, uint16_t * pm10) {
     uint8_t cmdBuf[] = {0x68, 0x01, 0x04, 0x93};
-    static uint8_t dataBuf[HPM_READ_PARTICLE_MEASURMENT_LEN - 1];
+    static uint8_t dataBuf[HPM_READ_PARTICLE_MEASUREMENT_LEN - 1];
     
     DEBUG_PRINT_VERBOSE(HPMA115S0_DEBUG_LEVEL,(char*)"Reading Particle Measurements...\r\n");
 
@@ -131,7 +131,7 @@ boolean HPMA115S0::ReadParticleMeasurement(uint16_t * pm2_5, uint16_t * pm10) {
     SendCmd(cmdBuf, 4);
 
     //Read response
-    if (ReadCmdResp(dataBuf, sizeof(dataBuf), READ_PARTICLE_MEASURMENT) == (HPM_READ_PARTICLE_MEASURMENT_LEN - 1)) {
+    if (ReadCmdResp(dataBuf, sizeof(dataBuf), READ_PARTICLE_MEASUREMENT) == (HPM_READ_PARTICLE_MEASUREMENT_LEN - 1)) {
         _pm2_5 = dataBuf[0] * 256 + dataBuf[1];
         _pm10 = dataBuf[2] * 256 + dataBuf[3];
         *pm2_5 = _pm2_5;

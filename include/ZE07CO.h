@@ -1,22 +1,6 @@
 /*
-  ZE07CO_Sensor.h - ZE07-CO Sensor library
-  Developed by Valentin - 2018/01/03
-
-  This library is free software; you can redistribute it and/or
-  modify it under the terms of the GNU Lesser General Public
-  License as published by the Free Software Foundation; either
-  version 2.1 of the License, or (at your option) any later version.
-
-  This library is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-  Lesser General Public License for more details.
-
-
-
-Version 1.0: 03 Jan 2018 by Valentin
-- Updated to build against Arduino 1.0.6
-- Made accessors inline in the header so they can be optimized away
+  ZE07CO_Sensor.cpp - ZE07-CO_Sensor library
+  Developed by Fernando Fontes - 2020/02/14
 */
 
 
