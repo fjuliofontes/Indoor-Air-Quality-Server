@@ -41,6 +41,6 @@
 - [ ] Solder all the components and re-test again.
   
 #### Media:
-![](IAQ-MONITOR-MKR1000/media/node-red-demo.gif)
-<img src="IAQ-MONITOR-MKR1000/media/node-red.png" width="200" height="200">
+![](media/node-red-demo.gif)<br/>
+<img src="media/node-red.png" width="200" height="200">
 
