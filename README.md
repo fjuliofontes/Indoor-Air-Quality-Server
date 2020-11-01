@@ -44,5 +44,6 @@
 <p align="center">
 <img src="media/node-red-demo.gif"><br/>
 <img src="media/node-red.png" width="200" height="200">
+<img src="media/board.png">
 </p>
 
