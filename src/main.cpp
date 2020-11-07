@@ -33,12 +33,12 @@
 #include "util.h"
 
 // Reading periodicity in (ms)
-#define BME_680_PERIOD 5000         // every 5 seconds
 #define HPMA115S0_PERIOD 5*60000    // every 5*60 seconds
 #define ZE07_PERIOD 5*60000         // every 5*60 seconds
 #define T6615_PERIOD 5*60000        // every 5*60 seconds
 #define DS18B20_PERIOD 5000         // every 5 seconds
 #define STATE_SAVE_PERIOD	UINT32_C(360 * 60 * 1000) // 360 minutes - 4 times a day
+//#define SEND_HEART_BEAT
 
 /* Declared Functions */
 void printWifiStatus();
@@ -244,6 +244,8 @@ void setup() {
     /// DS18B20
     /// init sensor
     ds18b20.begin();
+    /// set sensor to be async
+    ds18b20.setWaitForConversion(false);
 
     // On success hold the led on
     digitalWrite(LED_BUILTIN,HIGH);
@@ -291,78 +293,82 @@ void loop() {
     // send MQTT keep alive which avoids being disconnected by the broker
     mqttClient.poll();
 
-    if((millis() - bmeLastReading) > BME_680_PERIOD){
+    // read BME680 and publish results through MQTT (takes 80ms to send 9 messages)
+    // this sensor needs to be readden every 3 seconds, otherwise the accuracy will be always zero
+    // this means that after one read, we only have around 3 seconds of spare time to the other calls
+    if (iaqSensor.run()) {
+#ifdef SEND_HEART_BEAT
         bmeLastReading = millis();
+#endif
+        // Temperature
+        payload = myFTOA(iaqSensor.temperature,3,10);
+        mqttClient.beginMessage(outTopic[2], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-        // read BME680
-        if (iaqSensor.run()) {
-            // Temperature
-            payload = myFTOA(iaqSensor.temperature,3,10);
-            mqttClient.beginMessage(outTopic[2], payload.length(), retained, qos, dup);
-            mqttClient.print(payload);
-            mqttClient.endMessage();
+        // Humidity
+        payload = myFTOA(iaqSensor.humidity,3,10);
+        mqttClient.beginMessage(outTopic[3], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-            // Humidity
-            payload = myFTOA(iaqSensor.humidity,3,10);
-            mqttClient.beginMessage(outTopic[3], payload.length(), retained, qos, dup);
-            mqttClient.print(payload);
-            mqttClient.endMessage();
+        // raw Temperature
+        payload = myFTOA(iaqSensor.rawTemperature,3,10);
+        mqttClient.beginMessage(outTopic[11], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-            // raw Temperature
-            payload = myFTOA(iaqSensor.rawTemperature,3,10);
-            mqttClient.beginMessage(outTopic[11], payload.length(), retained, qos, dup);
-            mqttClient.print(payload);
-            mqttClient.endMessage();
+        // raw Humidity
+        payload = myFTOA(iaqSensor.rawHumidity,3,10);
+        mqttClient.beginMessage(outTopic[12], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-            // raw Humidity
-            payload = myFTOA(iaqSensor.rawHumidity,3,10);
-            mqttClient.beginMessage(outTopic[12], payload.length(), retained, qos, dup);
-            mqttClient.print(payload);
-            mqttClient.endMessage();
+        // Pressure
+        payload = myFTOA(iaqSensor.pressure/100.0f,3,10);
+        mqttClient.beginMessage(outTopic[4], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-            // Pressure
-            payload = myFTOA(iaqSensor.pressure/100.0f,3,10);
-            mqttClient.beginMessage(outTopic[4], payload.length(), retained, qos, dup);
-            mqttClient.print(payload);
-            mqttClient.endMessage();
+        // IAQ
+        payload = myFTOA(iaqSensor.iaq,3,10);
+        mqttClient.beginMessage(outTopic[5], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
+        
+        // Static IAQ
+        payload = myFTOA(iaqSensor.staticIaq,3,10);
+        mqttClient.beginMessage(outTopic[6], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-            // IAQ
-            payload = myFTOA(iaqSensor.iaq,3,10);
-            mqttClient.beginMessage(outTopic[5], payload.length(), retained, qos, dup);
-            mqttClient.print(payload);
-            mqttClient.endMessage();
-            
-            // Static IAQ
-            //payload = myFTOA(iaqSensor.staticIaq,3,10);
-            //mqttClient.beginMessage(outTopic[6], payload.length(), retained, qos, dup);
-            //mqttClient.print(payload);
-            //mqttClient.endMessage();
+        // Static equivalent CO2
+        payload = myFTOA(iaqSensor.co2Equivalent,3,10);
+        mqttClient.beginMessage(outTopic[7], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-            // Static equivalent CO2
-            //payload = myFTOA(iaqSensor.co2Equivalent,3,10);
-            //mqttClient.beginMessage(outTopic[7], payload.length(), retained, qos, dup);
-            //mqttClient.print(payload);
-            //mqttClient.endMessage();
+        // Static equivalent breath VOCs
+        payload = myFTOA(iaqSensor.breathVocEquivalent,3,10);
+        mqttClient.beginMessage(outTopic[8], payload.length(), retained, qos, dup);
+        mqttClient.print(payload);
+        mqttClient.endMessage();
 
-            // Static equivalent breath VOCs
-            //payload = myFTOA(iaqSensor.breathVocEquivalent,3,10);
-            //mqttClient.beginMessage(outTopic[8], payload.length(), retained, qos, dup);
-            //mqttClient.print(payload);
-            //mqttClient.endMessage();
-
-            updateState();
-
-            /*
-            _printf((char*)"IAQ Accuracy %u \r\n",iaqSensor.iaqAccuracy);
-            _printf((char*)"Breath Voc Accuracy %u \r\n",iaqSensor.breathVocAccuracy);
-            _printf((char*)"Co2 Accuracy %u \r\n",iaqSensor.co2Accuracy);
-            _printf((char*)"Static Iaq Accuracy %u \r\n",iaqSensor.staticIaqAccuracy);
-            */
-        } else {
-            checkIaqSensorStatus();
-        }
+        updateState();
+    } else {
+        checkIaqSensorStatus();
     }
 
+    // if BME680 next call is in less then 200 ms, there is no time to play with other sensors, just 
+    // return and wait until having more spare time. The 200ms was calculated based on the worst case
+    // scenario of the time taken by the functions bellow.
+    if((iaqSensor.nextCall - millis()) <= 200){
+        return;
+    }
+
+    // read the CO sensor (takes 29ms to read and sent its value)
+    // this sensor after the first utilization will have a fixed lifestamp given by the datasheet
+    // no mater the read frequency the lifetime will not be affected
     if((millis() - ze07LastReading) > ZE07_PERIOD){
         ze07LastReading = millis();
 
@@ -376,19 +382,25 @@ void loop() {
         mqttClient.endMessage();
     }
 
+    // read the CO2 sensor (takes 4ms to wake up and 25ms to read and sent its value)
+    // this sensor will degrate with the operational time, meaning that reading to often this sensor
+    // will probably short it's the lifetime
+    // to avoid that, we are only reading the sensor from 5 to 5 minutes, shuting it down on idle time
+    // However, we are awaking the sensor only 60 seconds before the reading interval, maybe this isn't enough
+    // We need to understand also if the sensor on awake should be set to warmup or if it is fine to just read it
     if((millis() - t6615LastReading) > _t6615_period){
         t6615LastReading = millis();
         t6615Status = t6615.get_status();
         if(t6615Status != T6615_TIMEOUT){
             /* Idle Mode */
             if(t6615Status == T6615_IDLE_MODE){
-                _t6615_period = 20000; // back again in 20 seconds
+                _t6615_period = 60000; // back again in 60 seconds
                 t6615.idle_off(); // go back to normal operation
                 //t6615.start_warmup(); // go back to normal operation and do pre-heating
             }
             /* Normal Mode */
             else if(t6615Status == T6615_OK){
-                _t6615_period = T6615_PERIOD-20000; // go back ten seconds before period time to warmup
+                _t6615_period = T6615_PERIOD-60000; // go back 60 seconds before period time to warmup
                 // read the sensor
                 retries = 5;
                 do{ co2_ppm = t6615.read_co2();} while(((retries--) > 0) && (co2_ppm == T6615_TIMEOUT));
@@ -402,7 +414,7 @@ void loop() {
             }
             /* WARMUP_MODE */
             else if(t6615Status == T6615_WARMUP_MODE){
-                _t6615_period = 15000; // try again 15 seconds later
+                _t6615_period = 30000; // try again 30 seconds later
             }
             /* default */
             else{
@@ -413,6 +425,10 @@ void loop() {
         }
     }
 
+    // read the particle sensor (takes 0ms to wake up and 37ms to read and sent its values)
+    // Just like the CO2 sensor, the lifetime of this sensor it is also affected by how often the sensor 
+    // is redden. So the same logic is applied here. However, in this sensor, turning it on only 10 seconds
+    // before the read interval is enough.
     if((millis() - hpmaLastReading) > _hpma115s0_period){
         hpmaLastReading = millis(); // restart timer
 
@@ -447,14 +463,18 @@ void loop() {
         }
     }
     
+    // read the dallas temperature sensor (takes 2ms to trigger and 40ms to read and sent its value)
+    // a new read should be triggered before the actually reading of the temperature value
+    // this way, this function is being called 800ms before the actual reading interval
+    // since the sensor needs 637ms to have the sample done
     if((millis() - ds18b20LastReading) > _ds18b20_period){
         ds18b20LastReading = millis(); // restart timer
         if(_ds18b20_status == ds18b20_askTemperature){
-            _ds18b20_period = 100;                      // return again in 100 ms 
+            _ds18b20_period = 800;                      // return again in 800 ms 
             _ds18b20_status = ds18b20_readTemperature;  // update the new state
             ds18b20.requestTemperatures();
         }else{
-            _ds18b20_period = DS18B20_PERIOD-100;       // return in period minus 100 ms 
+            _ds18b20_period = DS18B20_PERIOD-800;       // return in period minus 800 ms 
             _ds18b20_status = ds18b20_askTemperature;   // update the new state
             tempC = ds18b20.getTempCByIndex(0);         // read temperature
             
@@ -464,19 +484,23 @@ void loop() {
             mqttClient.print(payload);
             mqttClient.endMessage();
         }
-
     }
 
+    // send heart beat to debug possible delays and possible overflows that may occur
+    // takes 20ms to send heartbeat
+#ifdef SEND_HEART_BEAT
     if((millis()-lastHeartBeat) > 1000){
         lastHeartBeat = millis();
         heartBeat();
     }
+#endif
     
 }
 
 void onMqttMessage(int messageSize) {
     static char recv_topic[50];
-    static char recv_msg[50];
+    static char recv_msg[160];
+    static char params[20];
     uint8_t i = 0;
 
     // check if we have space
@@ -487,6 +511,7 @@ void onMqttMessage(int messageSize) {
     // clear buffers
     memset(recv_topic,'\0',sizeof(recv_topic));
     memset(recv_msg,'\0',sizeof(recv_msg));
+    memset(params,'\0',sizeof(params));
 
     // get topic name
     mqttClient.messageTopic().toCharArray(recv_topic,sizeof(recv_topic));
@@ -495,6 +520,13 @@ void onMqttMessage(int messageSize) {
     while (mqttClient.available()) {
         recv_msg[i++] = (char)mqttClient.read();
     }
+
+    // check if it is possible to be a setBme680Params command
+    if(messageSize >= 15){
+        memcpy(params,recv_msg,15);
+        params[15] = '\0'; 
+    }
+
 
     if (strcmp(recv_msg,(char*)"sendIp") == 0){
         IPAddress ip = WiFi.localIP();
@@ -513,6 +545,13 @@ void onMqttMessage(int messageSize) {
         mqttClient.beginMessage("MKR1000/BME680/Accuracy", payload.length(), retained, qos, dup);
         mqttClient.print(payload);
         mqttClient.endMessage();
+    }
+
+    else if(strcmp(params,(char*)"setBme680Params") == 0){
+        memcpy(bsecState,&recv_msg[15],BSEC_MAX_STATE_BLOB_SIZE);
+        iaqSensor.setState(bsecState);
+        checkIaqSensorStatus();
+        _printf((char*)"Bme680 State Set Done!\r\n");
     }
     
     else{
@@ -571,11 +610,11 @@ void errLeds(void){
 void loadState(void){
     if (EEPROM.read(0) == BSEC_MAX_STATE_BLOB_SIZE) {
         // Existing state in EEPROM
-        Serial.println("Reading state from EEPROM");
+        Serial.println("Reading state from EEPROM!");
 
         for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE; i++) {
             bsecState[i] = EEPROM.read(i + 1);
-            Serial.println(bsecState[i], HEX);
+            //Serial.println(bsecState[i], HEX);
         }
 
         iaqSensor.setState(bsecState);
@@ -620,11 +659,11 @@ void updateState(void){
     iaqSensor.getState(bsecState);
     checkIaqSensorStatus();
 
-    Serial.println("Writing state to EEPROM");
+    Serial.println("Writing state to EEPROM!");
 
     for (uint8_t i = 0; i < BSEC_MAX_STATE_BLOB_SIZE ; i++) {
       EEPROM.write(i + 1, bsecState[i]);
-      Serial.println(bsecState[i], HEX);
+      //Serial.println(bsecState[i], HEX);
     }
 
     EEPROM.write(0, BSEC_MAX_STATE_BLOB_SIZE);
