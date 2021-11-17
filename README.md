@@ -37,7 +37,7 @@
  - GPIO 2 (TX)  - RX T6615
   
 #### TODO:
-- [ ] Design a board for the hardware.
+- [ ] Design a PCB.
 - [ ] Solder all the components and re-test again.
   
 #### Media:
