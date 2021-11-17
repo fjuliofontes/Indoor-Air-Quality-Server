@@ -1,6 +1,6 @@
 # IAQ-Monitor-MKR1000
 
-### This repository contais a work in progress of an Indoor Air Quality Unit to easly install in your habitation.
+### This repository contains a work in progress of an Indoor Air Quality Unit to easily install in your habitation.
 
 #### Hardware:
   - 1 x [Arduino MKR1000 - MCU](https://store.arduino.cc/arduino-mkr1000-wifi)
