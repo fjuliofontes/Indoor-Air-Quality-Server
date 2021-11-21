@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "*.txt": "cpp"
+        "*.txt": "cpp",
+        "typeinfo": "cpp"
     }
 }

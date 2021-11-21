@@ -1,7 +1,8 @@
 #ifndef SECRETS_H
 #define SECRETS_H
 
-#define SECRET_SSID "ITHomeIOT"
-#define SECRET_PASS "pass1234"
+#define SECRET_SSID "YOUR_SSID"
+#define SECRET_PASS "YOUR_PASSWORD"
+#define FIREBASE_SERVER "YOUR_FIREBASE_SERVER"
 
 #endif

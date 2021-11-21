@@ -3,16 +3,19 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <stdint.h>
+
 // Global Defines
 #include "global_defs.h"
-// MQTT
-#include <ArduinoMqttClient.h>
+
 // WiFi and WiFi OTA
 #include <WiFi101.h>
 #include <WiFi101OTA.h>
+#include <RTCZero.h>
+
 // Bosch Sensor BME680
 #include "bsec.h"
-#include "config/generic_33v_3s_4d/bsec_serialized_configurations_iaq.h"
+#include "config/generic_33v_300s_4d/bsec_serialized_configurations_iaq.h"
+
 // Honeywell Sensor HPMA115S0
 #include "HPMA115S0.h"
 // ZE07-CO 
@@ -22,36 +25,59 @@
 // DS18B20
 #include <OneWire.h>
 #include <DallasTemperature.h>
+
 // WiFi secrets
 #include "secrets.h"
 // Sercom defs
 #include "sercom_defs.h"
+
 // Emulated EEPROM
 #include <FlashAsEEPROM.h>
+
+// Typedefs
+typedef struct {
+    float bme_temp;
+    float ds18b20_temp;
+    float bme_humi;
+    uint16_t co2;
+    float bme_co2;
+    float bme_evoc;
+    float bme_iaq;
+    float bme_press;
+    uint16_t pm10;
+    uint16_t pm2_5;
+    float co;
+    uint8_t accuracy;
+    uint32_t timestamp;
+} measurement_t;
+
 // Printf and others
 #define DEBUG
 #include "util.h"
 
-// Reading periodicity in (ms)
-#define HPMA115S0_PERIOD 5*60000    // every 5*60 seconds
-#define ZE07_PERIOD 5*60000         // every 5*60 seconds
-#define T6615_PERIOD 5*60000        // every 5*60 seconds
-#define DS18B20_PERIOD 5000         // every 5 seconds
+#define DEVICE_NAME_TEMPLATE "MKR1000-%02X%02X%02X%02X%02X%02X"
+#define DEVICE_NAME_SIZE (sizeof("MKR1000-000000000000")+1)
+#define PUBLISH_SIZE (sizeof("{\"timestamp\":4098895716000,\"t\":100.99,\"h\":100.00,\"p\":10000.00,\"iaq\":500.00,\"evoc\":1000.00,\"eco2\":10000.00,\"pm25\":10000,\"pm10\":10000,\"co2\":10000,\"co\":10000,\"dt\":100.00,\"a\":03}") + 1)
+#define PUBLISH_TEMPLATE "{\"timestamp\":%ld,\"t\":%.2f,\"h\":%.2f,\"p\":%.2f,\"iaq\":%.2f,\"evoc\":%.2f,\"eco2\":%.2f,\"pm25\":%d,\"pm10\":%d,\"co2\":%d,\"co\":%.2f,\"dt\":%.2f,\"a\":%d}"
+#define BOOTUP_TEMPLATE "{\"timestamp\":{\".sv\": \"timestamp\"},\"ip\":\"%d.%d.%d.%d\",\"ssid\":\"%s\",\"rssi\":%ld}"
+#define BOOTUP_TEMPLATE_SIZE (sizeof("{\"timestamp\":{\".sv\": \"timestamp\"},\"ip\":\"255.255.255.255\",\"ssid\":\"ITHOME0123456789\",\"rssi\":-255}") + 1)
 #define STATE_SAVE_PERIOD	UINT32_C(360 * 60 * 1000) // 360 minutes - 4 times a day
-//#define SEND_HEART_BEAT
+#define MAX_PENDING_MEASURES 350
 
 /* Declared Functions */
 void printWifiStatus();
-void onMqttMessage(int messageSize);
 void errLeds(void);
 void checkIaqSensorStatus(void);
 void loadState(void);
 void updateState(void);
-void heartBeat(void);
+void popElement(measurement_t * measurement, uint32_t* pending_measurements);
+int64_t getTimeMs(void);
+bool sendBootUpEvent();
 
 // Instantiate the extra Serial classes
 Uart Serial2(&sercom3, PIN_SERIAL2_RX, PIN_SERIAL2_TX, PAD_SERIAL2_RX, PAD_SERIAL2_TX);
 Uart Serial3(&sercom0, PIN_SERIAL3_RX, PIN_SERIAL3_TX, PAD_SERIAL3_RX, PAD_SERIAL3_TX);
+
 // Interrupt Handlers
 void SERCOM3_Handler(){ Serial2.IrqHandler(); }
 void SERCOM0_Handler(){ Serial3.IrqHandler(); }
@@ -72,79 +98,75 @@ float co_ppm = 0;
 
 // T6615
 T6615 t6615(&Serial3);
-uint16_t co2_ppm = 0, t6615Status;
+uint16_t co2_ppm = 0, t6615Status, last_co2_ppm;
 uint32_t _t6615_period = 20000;
 
 // DS18B20
 OneWire  ds(7);                     // on pin 7 (a 4.7K resistor is necessary)
 DallasTemperature ds18b20(&ds);     //
-float tempC;
-uint32_t _ds18b20_period = 1000;
-enum ds18b20state {
-    ds18b20_askTemperature = 0, 
-    ds18b20_readTemperature 
-}; 
-uint8_t _ds18b20_status = ds18b20_askTemperature;
 
 // General Use Variables
-unsigned long bmeLastReading = 0, hpmaLastReading = 0, ze07LastReading = 0, \
-              t6615LastReading = 0, ds18b20LastReading = 0, lastHeartBeat = 0;
+measurement_t measurements[MAX_PENDING_MEASURES];
+uint32_t pending_measurements = 0;
+char payload[PUBLISH_SIZE] = {'\0'};
+bool newReading = false;
+int64_t lastTime = 0;
+uint32_t millisOverflowCounter = 0;
+char device_name[DEVICE_NAME_SIZE] = {'\0'};
+bool sendBootUp = true;
+
 uint8_t retries = 0;
 char ssid[] = SECRET_SSID;        // your network SSID (name)
 char pass[] = SECRET_PASS;    // your network password (use for WPA, or use as key for WEP)
 
-// MQTT Variables
-WiFiClient wifiClient;
-MqttClient mqttClient(wifiClient);
-//
-bool retained = false;
-int qos = 1; // the the library supports subscribing at QoS 0, 1, or 2
-bool dup = false;
-int subscribeQos = 1; // the the library supports subscribing at QoS 0, 1, or 2
-const char broker[]     = "192.168.200.1";
-int        port         = 1883;
-const char willTopic[]  = "MKR1000/will";
-const char inTopic[]    = "MKR1000/updates";
-const char * outTopic[] =  { "MKR1000/HPMA115S0/PM2.5",
-                             "MKR1000/HPMA115S0/PM10",
-                             "MKR1000/BME680/Temp",
-                             "MKR1000/BME680/Humi",
-                             "MKR1000/BME680/Pres",
-                             "MKR1000/BME680/IAQ",
-                             "MKR1000/BME680/sIAQ",
-                             "MKR1000/BME680/eCO2",
-                             "MKR1000/BME680/eVOCb",
-                             "MKR1000/ZE07/CO",
-                             "MKR1000/T6615/CO2",
-                             "MKR1000/BME680/rawTemp",
-                             "MKR1000/BME680/rawHumi",
-                             "MKR1000/DS18B20/rawTemp"
-                           };
-String payload          = "";
+// WiFi related 
+WiFiClient client;
+RTCZero rtc;
+char server[] = FIREBASE_SERVER;    // name address for Google (using DNS)
 
 void setup() {
     // Serial Port USB
     Serial.begin(115200);
+
     // Serial Port for Honeywell Sensor
     Serial1.begin(9600);
+
     // I2C 
     Wire.begin();
+
     // Set LED_BUILTIN as Output and turn it off
     pinMode(LED_BUILTIN,OUTPUT);
     digitalWrite(LED_BUILTIN,LOW);
+
     //Extra Serial Ports
     /// ZE07-CO Sensor - 9600bps
     pinPeripheral(0, PIO_SERCOM);   // Assign pins 0 & 1 SERCOM functionality
     pinPeripheral(1, PIO_SERCOM);
     Serial2.begin(9600);
+
     /// T6615-CO2 Sensor - 19200bps
     pinPeripheral(2, PIO_SERCOM);   // Assign pins 2 & 3 SERCOM functionality
     pinPeripheral(3, PIO_SERCOM);
     Serial3.begin(19200);
 
+    // Get device MAC ADDR 
+    uint8_t mac[6];                 // the MAC address of your Wifi shield
+    WiFi.macAddress(mac);
+    snprintf(device_name,
+        sizeof(device_name),
+        DEVICE_NAME_TEMPLATE,
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
+
     // attempt to connect to Wifi network:
     Serial.print("Attempting to connect to WPA SSID: ");
     Serial.println(ssid);
+
     while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
         // failed, retry
         Serial.print(".");
@@ -153,53 +175,25 @@ void setup() {
     Serial.println("You're connected to the network");
     printWifiStatus();
 
-    // start the WiFi OTA library with internal (flash) based storage
-    WiFiOTA.begin("Arduino", "jf123", InternalStorage);
+    // calibrate RTC
+    rtc.begin();
+    unsigned long epoch = 0;
 
-    // You can provide a unique client ID, if not set the library uses Arduino-millis()
-    // Each client must have a unique client ID
-    mqttClient.setId("MKR1000");
-
-    // You can provide a username and password for authentication
-    // mqttClient.setUsernamePassword("username", "password");
-
-    // set a will message, used by the broker when the connection dies unexpectedly
-    // you must know the size of the message before hand, and it must be set before connecting
-    String willPayload = "disconnected!";
-    bool willRetain = true;
-    int willQos = 1;
-
-    mqttClient.beginWill(willTopic, willPayload.length(), willRetain, willQos);
-    mqttClient.print(willPayload);
-    mqttClient.endWill();
-
-    Serial.print("Attempting to connect to the MQTT broker: ");
-    Serial.println(broker);
-
-    while (!mqttClient.connect(broker, port)) {
-        Serial.print("MQTT connection failed! Error code = ");
-        Serial.println(mqttClient.connectError());
-        delay(5000);
+    Serial.println("Attempting to connect to NTP Server");
+    while (epoch == 0) {
+        epoch = WiFi.getTime();
+        Serial.print(".");
+        delay(1000);
     }
 
-    Serial.println("You're connected to the MQTT broker!");
-    Serial.println();
+    Serial.print("\nEpoch received: ");
+    Serial.println(epoch);
 
-    // set the message receive callback
-    mqttClient.onMessage(onMqttMessage);
+    // set epoch
+    rtc.setEpoch(epoch);
 
-    Serial.print("Subscribing to topic: ");
-    Serial.println(inTopic);
-    Serial.println();
-
-    mqttClient.subscribe(inTopic, subscribeQos);
-
-    // topics can be unsubscribed using:
-    // mqttClient.unsubscribe(inTopic);
-
-    Serial.print("Waiting for messages on topic: ");
-    Serial.println(inTopic);
-    Serial.println();
+    // start the WiFi OTA library with internal (flash) based storage
+    WiFiOTA.begin(device_name, "jf123", InternalStorage);
 
     // Sensors
     /// Honeywell Sensor
@@ -230,7 +224,7 @@ void setup() {
         BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
     };
     //// update subscription
-    iaqSensor.updateSubscription(sensorList, 10, BSEC_SAMPLE_RATE_LP);
+    iaqSensor.updateSubscription(sensorList, 10, BSEC_SAMPLE_RATE_ULP);
     checkIaqSensorStatus();
 
     /// ZE07-CO
@@ -244,318 +238,306 @@ void setup() {
     /// DS18B20
     /// init sensor
     ds18b20.begin();
-    /// set sensor to be async
-    ds18b20.setWaitForConversion(false);
+    /// set sensor to sync
+    ds18b20.setWaitForConversion(true);
 
     // On success hold the led on
     digitalWrite(LED_BUILTIN,HIGH);
 }
 
 void loop() {
-    // check if is still connected to WiFi
-    if(WiFi.status() != WL_CONNECTED){
-        _printf((char*)"Disconnected from WiFi \r\n");
-        // free some old configurations by disconnecting safely
-        WiFi.disconnect(); // stop wifi
-        mqttClient.stop(); // stop mqtt 
-        _printf((char*)"Attempting to re-connect to WPA SSID: %s ",ssid);
-        while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
-            _printf((char*)".");
-            for(int i = 0; i < 25; i++) errLeds(); // wait 5 seconds and try again
-        }
-        _printf((char*)"Re-connected!\r\n");
-        // re-configure OTA again
-        WiFiOTA.begin("Arduino", "jf123", InternalStorage);
-        // Re-enable the led state
-        digitalWrite(LED_BUILTIN,HIGH);
-    }
-
-    // check for WiFi OTA updates
-    WiFiOTA.poll();
-
-    // check if mqttClient is still connected and re-connect if not
-    if(!mqttClient.connected()){
-        _printf((char*)"Disconnected from Broker!\r\n");
-        _printf((char*)"Unsubscribing from topic %s retval %d \r\n",inTopic,mqttClient.unsubscribe(inTopic));
-        while (!mqttClient.connect(broker, port) && (WiFi.status() == WL_CONNECTED)) {
-            _printf((char*)"MQTT connection failed! Error code = %d \r\n",mqttClient.connectError());
-            for(int i = 0; i < 25; i++) errLeds(); // wait 5 seconds and try again
-        }
-        // on success subscribe to inTopic
-        if(mqttClient.connected()){
-            _printf((char*)"Subscribing again to topic %s retval %d \r\n",inTopic,mqttClient.subscribe(inTopic, subscribeQos));
-            // Re-enable the led state
-            digitalWrite(LED_BUILTIN,HIGH);
-        }
-    }
-
-    // call poll() regularly to allow the library to receive MQTT messages and
-    // send MQTT keep alive which avoids being disconnected by the broker
-    mqttClient.poll();
 
     // read BME680 and publish results through MQTT (takes 80ms to send 9 messages)
-    // this sensor needs to be readden every 3 seconds, otherwise the accuracy will be always zero
+    // this sensor needs to be read every 3 seconds, otherwise the accuracy will be always zero
     // this means that after one read, we only have around 3 seconds of spare time to the other calls
-    if (iaqSensor.run()) {
-#ifdef SEND_HEART_BEAT
-        bmeLastReading = millis();
-#endif
+    if (iaqSensor.run(getTimeMs())) {
+
+        Serial.println("BME measure done!");
+        Serial.flush();
+
+        // EPOCH
+        measurements[pending_measurements].timestamp = rtc.getEpoch();
+
         // Temperature
-        payload = myFTOA(iaqSensor.temperature,3,10);
-        mqttClient.beginMessage(outTopic[2], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
+        measurements[pending_measurements].bme_temp = iaqSensor.temperature;
 
         // Humidity
-        payload = myFTOA(iaqSensor.humidity,3,10);
-        mqttClient.beginMessage(outTopic[3], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
-
-        // raw Temperature
-        payload = myFTOA(iaqSensor.rawTemperature,3,10);
-        mqttClient.beginMessage(outTopic[11], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
-
-        // raw Humidity
-        payload = myFTOA(iaqSensor.rawHumidity,3,10);
-        mqttClient.beginMessage(outTopic[12], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
+        measurements[pending_measurements].bme_humi = iaqSensor.humidity;
 
         // Pressure
-        payload = myFTOA(iaqSensor.pressure/100.0f,3,10);
-        mqttClient.beginMessage(outTopic[4], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
+        measurements[pending_measurements].bme_press = iaqSensor.pressure/100.0f;
 
         // IAQ
-        payload = myFTOA(iaqSensor.iaq,3,10);
-        mqttClient.beginMessage(outTopic[5], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
-        
-        // Static IAQ
-        payload = myFTOA(iaqSensor.staticIaq,3,10);
-        mqttClient.beginMessage(outTopic[6], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
+        measurements[pending_measurements].bme_iaq = iaqSensor.iaq;
 
         // Static equivalent CO2
-        payload = myFTOA(iaqSensor.co2Equivalent,3,10);
-        mqttClient.beginMessage(outTopic[7], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
+        measurements[pending_measurements].bme_co2 = iaqSensor.co2Equivalent;
 
         // Static equivalent breath VOCs
-        payload = myFTOA(iaqSensor.breathVocEquivalent,3,10);
-        mqttClient.beginMessage(outTopic[8], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
+        measurements[pending_measurements].bme_evoc = iaqSensor.breathVocEquivalent;
 
+        // get accuracy 
+        measurements[pending_measurements].accuracy = iaqSensor.iaqAccuracy;
+
+        // save state 
         updateState();
-    } else {
-        checkIaqSensorStatus();
-    }
 
-    // if BME680 next call is in less then 200 ms, there is no time to play with other sensors, just 
-    // return and wait until having more spare time. The 200ms was calculated based on the worst case
-    // scenario of the time taken by the functions bellow.
-    if((iaqSensor.nextCall - millis()) <= 200){
-        return;
-    }
+        // read the dallas temperature sensor (takes 2ms to trigger and 40ms to read and send its value)
+        // a new read should be triggered before the actually reading of the temperature value
+        // this way, this function is being called 800ms before the actual reading interval
+        // since the sensor needs 637ms to have the sample done
 
-    // read the CO sensor (takes 29ms to read and sent its value)
-    // this sensor after the first utilization will have a fixed lifestamp given by the datasheet
-    // no mater the read frequency the lifetime will not be affected
-    if((millis() - ze07LastReading) > ZE07_PERIOD){
-        ze07LastReading = millis();
+        // request temperature and block till ready
+        Serial.println("Going to read ds18b20!");
+        Serial.flush();
+        ds18b20.requestTemperatures();
+
+        // save
+        measurements[pending_measurements].ds18b20_temp = ds18b20.getTempCByIndex(0);  // read temperature
+        Serial.println("ds18b20 read ok!");
+        Serial.flush();
+
+        // read the CO sensor (takes 29ms to read and send its value)
+        // this sensor after the first utilization will have a fixed lifestamp given by the datasheet
+        // no matter the read frequency the lifetime will be the same
 
         // read ze07
+        Serial.println("Going to read ze07!");
+        Serial.flush();
         retries = 5;
-        do{ co_ppm = ze07.read(); } while(((retries--) > 0) && ((co_ppm < 0) || (co_ppm > 500)));
-        
-        payload = myFTOA(co_ppm,3,10);
-        mqttClient.beginMessage(outTopic[9], payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
-    }
+        do { 
+            co_ppm = ze07.read(); 
+        } while (
+            ((retries--) > 0) && 
+            ((co_ppm < 0) || (co_ppm > 500))
+        );
+        Serial.println("ze07 done!");
+        Serial.flush();
 
-    // read the CO2 sensor (takes 4ms to wake up and 25ms to read and sent its value)
-    // this sensor will degrate with the operational time, meaning that reading to often this sensor
-    // will probably short it's the lifetime
-    // to avoid that, we are only reading the sensor from 5 to 5 minutes, shuting it down on idle time
-    // However, we are awaking the sensor only 60 seconds before the reading interval, maybe this isn't enough
-    // We need to understand also if the sensor on awake should be set to warmup or if it is fine to just read it
-    if((millis() - t6615LastReading) > _t6615_period){
-        t6615LastReading = millis();
-        t6615Status = t6615.get_status();
-        if(t6615Status != T6615_TIMEOUT){
-            /* Idle Mode */
-            if(t6615Status == T6615_IDLE_MODE){
-                _t6615_period = 60000; // back again in 60 seconds
-                t6615.idle_off(); // go back to normal operation
-                //t6615.start_warmup(); // go back to normal operation and do pre-heating
+        // co concentration in ppm
+        measurements[pending_measurements].co = co_ppm;
+
+        // read the CO2 sensor (takes 4ms to wake up and 25ms to read and send its value)
+        // this sensor will degrate with the operational time, meaning that reading too often
+        // will probably short it's the lifetime
+        // to avoid that, we are only reading the sensor from 5 to 5 minutes, shutting it down on idle time
+        // However, we are awaking the sensor only 60 seconds before the reading interval, maybe this isn't enough
+        // We need to understand also if the sensor on awake should be set to warmup or if it is fine to just read it
+
+        Serial.println("Going to read t6615!");
+        Serial.flush();
+        for (retries = 0; retries < 4; retries++) {
+
+            t6615Status = t6615.get_status();
+
+            if(t6615Status != T6615_TIMEOUT) {
+
+                /* Idle Mode */
+                if(t6615Status == T6615_IDLE_MODE) {
+                    Serial.println("T6615_IDLE_MODE");
+                    Serial.flush();
+                    _t6615_period = 60000; // back again in 60 seconds
+                    t6615.idle_off(); // go back to normal operation
+                    //t6615.start_warmup(); // go back to normal operation and do pre-heating
+                }
+
+                /* Normal Mode */
+                else if(t6615Status == T6615_OK){
+                    Serial.println("T6615_OK");
+                    Serial.flush();
+
+                    // read the sensor
+                    retries = 5;
+                    do { 
+                        co2_ppm = t6615.read_co2();
+                    } while(((retries--) > 0) && (co2_ppm == T6615_TIMEOUT));
+                    // go to idle mode
+                    t6615.idle_on();
+                    // save 
+                    if (co2_ppm != T6615_TIMEOUT) measurements[pending_measurements].co2 = co2_ppm;
+                    else measurements[pending_measurements].co2 = last_co2_ppm;
+                    // backup reading
+                    if (co2_ppm != T6615_TIMEOUT) last_co2_ppm = co2_ppm;
+                    // done
+                    break;
+                }
+                /* WARMUP_MODE */
+                else if(t6615Status == T6615_WARMUP_MODE){
+                    Serial.println("T6615_WARMUP_MODE");
+                    Serial.flush();
+                    _t6615_period = 30000; // try again 30 seconds later
+                }
+                /* default */
+                else{
+                    _t6615_period = 5000; // try again 5 seconds later
+                }
+            } else {
+                Serial.println("INVALID");
+                Serial.flush();
+                _t6615_period = 1000; // try again 1 seconds later
             }
-            /* Normal Mode */
-            else if(t6615Status == T6615_OK){
-                _t6615_period = T6615_PERIOD-60000; // go back 60 seconds before period time to warmup
-                // read the sensor
-                retries = 5;
-                do{ co2_ppm = t6615.read_co2();} while(((retries--) > 0) && (co2_ppm == T6615_TIMEOUT));
-                // go to idle mode
-                t6615.idle_on();
-                // send via MQTT
-                payload = myITOA(co2_ppm,10,0);
-                mqttClient.beginMessage(outTopic[10], payload.length(), retained, qos, dup);
-                mqttClient.print(payload);
-                mqttClient.endMessage();
-            }
-            /* WARMUP_MODE */
-            else if(t6615Status == T6615_WARMUP_MODE){
-                _t6615_period = 30000; // try again 30 seconds later
-            }
-            /* default */
-            else{
-                _t6615_period = 5000; // try again 5 seconds later
-            }
-        }else{
-            _t6615_period = 1000; // try again 1 seconds later
+
+            // sleep necessary amount of time
+            delay(_t6615_period);
         }
-    }
 
-    // read the particle sensor (takes 0ms to wake up and 37ms to read and sent its values)
-    // Just like the CO2 sensor, the lifetime of this sensor it is also affected by how often the sensor 
-    // is redden. So the same logic is applied here. However, in this sensor, turning it on only 10 seconds
-    // before the read interval is enough.
-    if((millis() - hpmaLastReading) > _hpma115s0_period){
-        hpmaLastReading = millis(); // restart timer
+        Serial.println("t6615 done!");
+        Serial.flush();
 
-        if(hpma115S0.Status() == HPMA115S0_OFF){
-            _hpma115s0_period = 10000; // return again to this function in 10 seconds 
-            hpma115S0.StartParticleMeasurement(); // start particle measurement 
-        }else{
-            _hpma115s0_period = HPMA115S0_PERIOD-10000; // return in period less 10 seconds for heating 
-            //The guideline stipulates that PM2.5 not exceed 10 μg/m³ annual mean, or 25 μg/m³ 24-hour mean; 
-            //PM10 not exceed 20 μg/m³ annual mean, or 50 μg/m³ 24-hour mean.
-            if (hpma115S0.ReadParticleMeasurement(&pm2_5, &pm10)) {
-                //_printf((char*)"PM2.5: %u ug/m3 \r\n",pm2_5);
-                //_printf((char*)"PM10: %u ug/m3 \r\n",pm10);
+        // read the particle sensor (takes 0ms to wake up and 37ms to read and send its values)
+        // Just like the CO2 sensor, the lifetime of this sensor it is also affected by how often the sensor 
+        // is redden. So the same logic is applied here. However, in this sensor, turning it on only 10 seconds
+        // before the read interval is enough.
 
-                //if(pm2_5 > 25) _printf((char*)"PM2.5 is exceeding the acceptable levels! \r\n");
-                //if(pm10 > 50) _printf((char*)"PM10 is exceeding the acceptable levels! \r\n");
-                
-                // PM2.5
-                payload = myITOA(pm2_5,10,0);
-                mqttClient.beginMessage(outTopic[0], payload.length(), retained, qos, dup);
-                mqttClient.print(payload);
-                mqttClient.endMessage();
-                
-                // PM10
-                payload = myITOA(pm10,10,0);
-                mqttClient.beginMessage(outTopic[1], payload.length(), retained, qos, dup);
-                mqttClient.print(payload);
-                mqttClient.endMessage();
+        Serial.println("Going to read particle!");
+        Serial.flush();
+        for (retries = 0; retries < 3; retries++) {
+            if(hpma115S0.Status() == HPMA115S0_OFF) {
+                Serial.println("HPMA115S0_OFF");
+                Serial.flush();
+                _hpma115s0_period = 10000; // return again to this function in 10 seconds 
+                hpma115S0.StartParticleMeasurement(); // start particle measurement 
+            } else {
+                //The guideline stipulates that PM2.5 not exceed 10 μg/m³ annual mean, or 25 μg/m³ 24-hour mean; 
+                //PM10 not exceed 20 μg/m³ annual mean, or 50 μg/m³ 24-hour mean.
+                if (hpma115S0.ReadParticleMeasurement(&pm2_5, &pm10)) {
+                    Serial.println("ReadParticleMeasurement");
+                    Serial.flush();
+                    // stop particle measurements
+                    hpma115S0.StopParticleMeasurement(); // stop particle measurement
+
+                    // save
+                    measurements[pending_measurements].pm10 = pm10;
+                    measurements[pending_measurements].pm2_5 = pm2_5;
+
+                    // done
+                    break;
+                } else {
+                    _hpma115s0_period = 1000; // try again in 1 sec
+                }
             }
-       
-            hpma115S0.StopParticleMeasurement(); // stop particle measurement
+            // sleep necessary amount of time
+            delay(_hpma115s0_period);
         }
-    }
-    
-    // read the dallas temperature sensor (takes 2ms to trigger and 40ms to read and sent its value)
-    // a new read should be triggered before the actually reading of the temperature value
-    // this way, this function is being called 800ms before the actual reading interval
-    // since the sensor needs 637ms to have the sample done
-    if((millis() - ds18b20LastReading) > _ds18b20_period){
-        ds18b20LastReading = millis(); // restart timer
-        if(_ds18b20_status == ds18b20_askTemperature){
-            _ds18b20_period = 800;                      // return again in 800 ms 
-            _ds18b20_status = ds18b20_readTemperature;  // update the new state
-            ds18b20.requestTemperatures();
-        }else{
-            _ds18b20_period = DS18B20_PERIOD-800;       // return in period minus 800 ms 
-            _ds18b20_status = ds18b20_askTemperature;   // update the new state
-            tempC = ds18b20.getTempCByIndex(0);         // read temperature
-            
-            // Send
-            payload = myFTOA(tempC,3,10);
-            mqttClient.beginMessage(outTopic[13], payload.length(), retained, qos, dup);
-            mqttClient.print(payload);
-            mqttClient.endMessage();
-        }
+
+        Serial.println("particle done!");
+        Serial.flush();
+
+        // flag new reading
+        pending_measurements ++;
+
+        // pop old elements
+        if (pending_measurements == MAX_PENDING_MEASURES) popElement(measurements,&pending_measurements);
+
     }
 
-    // send heart beat to debug possible delays and possible overflows that may occur
-    // takes 20ms to send heartbeat
-#ifdef SEND_HEART_BEAT
-    if((millis()-lastHeartBeat) > 1000){
-        lastHeartBeat = millis();
-        heartBeat();
+    else {
+        checkIaqSensorStatus();
     }
-#endif
-    
-}
 
-void onMqttMessage(int messageSize) {
-    static char recv_topic[50];
-    static char recv_msg[160];
-    static char params[20];
-    uint8_t i = 0;
+    if (pending_measurements > 0) Serial.println(iaqSensor.nextCall - getTimeMs());
 
-    // check if we have space
-    if((sizeof(recv_msg) < (uint16_t)messageSize) || (sizeof(recv_topic) < mqttClient.messageTopic().length())){
+    // still have time ?
+    if ( ( iaqSensor.nextCall - getTimeMs() ) < 30000) {
         return;
     }
-
-    // clear buffers
-    memset(recv_topic,'\0',sizeof(recv_topic));
-    memset(recv_msg,'\0',sizeof(recv_msg));
-    memset(params,'\0',sizeof(params));
-
-    // get topic name
-    mqttClient.messageTopic().toCharArray(recv_topic,sizeof(recv_topic));
-
-    // use the Stream interface to print the contents
-    while (mqttClient.available()) {
-        recv_msg[i++] = (char)mqttClient.read();
-    }
-
-    // check if it is possible to be a setBme680Params command
-    if(messageSize >= 15){
-        memcpy(params,recv_msg,15);
-        params[15] = '\0'; 
-    }
-
-
-    if (strcmp(recv_msg,(char*)"sendIp") == 0){
-        IPAddress ip = WiFi.localIP();
-        payload = "Connected to: "+ String(WiFi.SSID())+ " with IP: ";
-        for (int k=0; k < 3; k++) payload += String(ip[k], DEC) + ".";
-        payload += String(ip[3], DEC);
-        mqttClient.beginMessage("MKR1000/status/IP", payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
-    }
-
-    else if(strcmp(recv_msg,(char*)"sendBme680Accuracy") == 0){
-        // Accuracy
-        payload = "IAQ: " + String(iaqSensor.iaqAccuracy) + " eVOC: " + String(iaqSensor.breathVocAccuracy) + 
-                " eCO2: " + String(iaqSensor.co2Accuracy) + " sIAQ: " + String(iaqSensor.staticIaqAccuracy);
-        mqttClient.beginMessage("MKR1000/BME680/Accuracy", payload.length(), retained, qos, dup);
-        mqttClient.print(payload);
-        mqttClient.endMessage();
-    }
-
-    else if(strcmp(params,(char*)"setBme680Params") == 0){
-        memcpy(bsecState,&recv_msg[15],BSEC_MAX_STATE_BLOB_SIZE);
-        iaqSensor.setState(bsecState);
-        checkIaqSensorStatus();
-        _printf((char*)"Bme680 State Set Done!\r\n");
-    }
     
-    else{
-        _printf((char*)"Received a message with topic (%s) with content (%s) \r\n",recv_topic,recv_msg);
+    // disconnected? try to reconnect
+    if (WiFi.status() != WL_CONNECTED){
+
+        digitalWrite(LED_BUILTIN,LOW);
+
+        _printf((char*)"Disconnected from WiFi \r\n");
+
+        _printf((char*)"Attempting to re-connect to WPA SSID: %s ",ssid);
+
+        if ( WiFi.begin(ssid, pass) == WL_CONNECTED ) {
+
+            printf((char*)"Re-connected!\r\n");
+
+            // Re-enable the led state
+            digitalWrite(LED_BUILTIN,HIGH);
+
+            // Re-send bootup event
+            sendBootUp = true;
+        }
+
+    }
+
+    // is to send bootup?
+    if ((WiFi.status() == WL_CONNECTED) && sendBootUp) {
+        sendBootUp = !sendBootUpEvent();
+    }
+
+    // ota related
+    if( WiFi.status() == WL_CONNECTED ) {
+        // check for WiFi OTA updates
+        WiFiOTA.poll();
+    }
+
+    // publish new readings
+    if( (WiFi.status() == WL_CONNECTED) && (pending_measurements > 0) ) {
+
+        Serial.println("trying to connect to server");
+        Serial.flush();
+        
+        if (client.connectSSL(server, 443)) {
+            Serial.println("connected to server");
+            Serial.flush();
+
+            snprintf(payload,
+                sizeof(payload),
+                PUBLISH_TEMPLATE,
+                measurements[0].timestamp,
+                measurements[0].bme_temp,
+                measurements[0].bme_humi,
+                measurements[0].bme_press,
+                measurements[0].bme_iaq,
+                measurements[0].bme_evoc,
+                measurements[0].bme_co2,
+                measurements[0].pm2_5,
+                measurements[0].pm10,
+                measurements[0].co2,
+                measurements[0].co,
+                measurements[0].ds18b20_temp,
+                measurements[0].accuracy
+            );
+
+            Serial.println(String(payload));
+            Serial.flush();
+
+            // Make a HTTP request:
+            client.println("POST /" + String(device_name) + ".json HTTP/1.1");
+            client.println("Host: " + String(server));
+            client.println("Connection: close");
+            client.println("Content-Type: application/json");
+            client.print("Content-Length: ");
+            client.println(String(payload).length());
+            client.println();
+            client.println(String(payload));
+            client.println();
+
+            unsigned long timeout = millis();
+            while (client.connected() && millis() - timeout < 10000L) {
+                // Print available data (HTTP response from server)
+                while (client.available()) {
+                    client.read();
+                    // _printf((char*)"%c",c);
+                    timeout = millis();
+                }
+                // _printf((char*)"\r\n");
+            }
+
+            // close connection
+            client.stop();
+
+            // on success pop element
+            popElement(measurements,&pending_measurements);
+
+        } else {
+            Serial.println("failed to connect");
+            Serial.flush();
+        }
     }
 }
 
@@ -570,10 +552,64 @@ void printWifiStatus() {
     Serial.println(ip);
 
     // print the received signal strength:
-    long rssi = WiFi.RSSI();
+    int32_t rssi = WiFi.RSSI();
     Serial.print("signal strength (RSSI):");
     Serial.print(rssi);
     Serial.println(" dBm");
+}
+
+bool sendBootUpEvent() {
+    Serial.println("Trying to send boot up event!");
+
+    if (client.connectSSL(server, 443)) {
+
+        char bootup[BOOTUP_TEMPLATE_SIZE] = {'\0'};
+
+        // Get ip
+        IPAddress ip = WiFi.localIP();
+
+        snprintf(bootup,
+            BOOTUP_TEMPLATE_SIZE,
+            BOOTUP_TEMPLATE,
+            ip[0],
+            ip[1],
+            ip[2],
+            ip[3],
+            WiFi.SSID(),
+            WiFi.RSSI()
+        );
+
+        Serial.println("Going to send: " + String(bootup));
+
+        // Make a HTTP request:
+        client.println("POST /" + String(device_name) + "-BOOTUP.json HTTP/1.1");
+        client.println("Host: " + String(server));
+        client.println("Connection: close");
+        client.println("Content-Type: application/json");
+        client.print("Content-Length: ");
+        client.println(String(bootup).length());
+        client.println();
+        client.println(String(bootup));
+        client.println();
+
+        unsigned long timeout = millis();
+        while (client.connected() && millis() - timeout < 10000L) {
+            // Print available data (HTTP response from server)
+            while (client.available()) {
+                client.read();
+                timeout = millis();
+            }
+        }
+
+        // close connection
+        client.stop();
+
+        // return
+        return true;
+
+    } else {
+        return false;
+    }
 }
 
 // Helper function definitions
@@ -671,11 +707,27 @@ void updateState(void){
   }
 }
 
-void heartBeat(void){
-    payload = "timestamp: " + String(millis()) + " bme: " + String(bmeLastReading)
-        + " ze07: " + String(ze07LastReading) + " t6615: " + String(t6615LastReading) 
-        + " hpma: " + String(hpmaLastReading);
-    mqttClient.beginMessage("MKR1000/HeartBeat", payload.length(), retained, qos, dup);
-    mqttClient.print(payload);
-    mqttClient.endMessage();
+void popElement(measurement_t * measurement, uint32_t* pending_measurements) {
+
+    // only if we have elements to pop
+    if (*pending_measurements <= 0) return;
+
+    for (int i = 0; i < (int)((*pending_measurements) - 1); i++) {
+        memcpy(&measurement[i],&measurement[i+1],sizeof(measurement_t));
+    }
+    *pending_measurements = *pending_measurements - 1;
+}
+
+int64_t getTimeMs(void)
+{
+    int64_t timeMs = millis();
+
+    if (lastTime > timeMs) /* An overflow occurred */
+    {
+        millisOverflowCounter++;
+    }
+
+    lastTime = timeMs;
+
+    return timeMs + ((int64_t)millisOverflowCounter << 32);
 }
