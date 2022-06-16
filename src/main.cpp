@@ -60,7 +60,7 @@ typedef struct {
 #define PUBLISH_SIZE (sizeof("{\"timestamp\":4098895716000,\"t\":100.99,\"h\":100.00,\"p\":10000.00,\"iaq\":500.00,\"evoc\":1000.00,\"eco2\":10000.00,\"pm25\":10000,\"pm10\":10000,\"co2\":10000,\"co\":10000,\"dt\":100.00,\"a\":03}") + 1)
 #define PUBLISH_TEMPLATE "{\"timestamp\":%ld,\"t\":%.2f,\"h\":%.2f,\"p\":%.2f,\"iaq\":%.2f,\"evoc\":%.2f,\"eco2\":%.2f,\"pm25\":%d,\"pm10\":%d,\"co2\":%d,\"co\":%.2f,\"dt\":%.2f,\"a\":%d}"
 #define BOOTUP_TEMPLATE "{\"timestamp\":{\".sv\": \"timestamp\"},\"ip\":\"%d.%d.%d.%d\",\"ssid\":\"%s\",\"rssi\":%ld}"
-#define BOOTUP_TEMPLATE_SIZE (sizeof("{\"timestamp\":{\".sv\": \"timestamp\"},\"ip\":\"255.255.255.255\",\"ssid\":\"ITHOME0123456789\",\"rssi\":-255}") + 1)
+#define BOOTUP_TEMPLATE_SIZE (sizeof("{\"timestamp\":{\".sv\": \"timestamp\"},\"ip\":\"255.255.255.255\",\"ssid\":\"HUAWEI-E5776-D797\",\"rssi\":-255}") + 1)
 #define STATE_SAVE_PERIOD	UINT32_C(360 * 60 * 1000) // 360 minutes - 4 times a day
 #define MAX_PENDING_MEASURES 350
 
@@ -149,6 +149,18 @@ void setup() {
     pinPeripheral(3, PIO_SERCOM);
     Serial3.begin(19200);
 
+    // attempt to connect to Wifi network:
+    Serial.print("Attempting to connect to WPA SSID: ");
+    Serial.println(ssid);
+
+    while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
+        // failed, retry
+        Serial.print(".");
+        delay(5000);
+    }
+    Serial.println("You're connected to the network");
+    printWifiStatus();
+
     // Get device MAC ADDR 
     uint8_t mac[6];                 // the MAC address of your Wifi shield
     WiFi.macAddress(mac);
@@ -162,18 +174,6 @@ void setup() {
         mac[4],
         mac[5]
     );
-
-    // attempt to connect to Wifi network:
-    Serial.print("Attempting to connect to WPA SSID: ");
-    Serial.println(ssid);
-
-    while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
-        // failed, retry
-        Serial.print(".");
-        delay(5000);
-    }
-    Serial.println("You're connected to the network");
-    printWifiStatus();
 
     // calibrate RTC
     rtc.begin();
@@ -354,10 +354,10 @@ void loop() {
                     // go to idle mode
                     t6615.idle_on();
                     // save 
-                    if (co2_ppm != T6615_TIMEOUT) measurements[pending_measurements].co2 = co2_ppm;
+                    if (co2_ppm <= 30000) measurements[pending_measurements].co2 = co2_ppm;
                     else measurements[pending_measurements].co2 = last_co2_ppm;
                     // backup reading
-                    if (co2_ppm != T6615_TIMEOUT) last_co2_ppm = co2_ppm;
+                    if (co2_ppm <= 30000) last_co2_ppm = co2_ppm;
                     // done
                     break;
                 }
@@ -369,6 +369,8 @@ void loop() {
                 }
                 /* default */
                 else{
+                    Serial.println("t6615Status: " + String(t6615Status));
+                    Serial.flush();
                     _t6615_period = 5000; // try again 5 seconds later
                 }
             } else {
